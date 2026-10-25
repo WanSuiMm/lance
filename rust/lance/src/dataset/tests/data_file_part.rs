@@ -20,7 +20,9 @@ use lance_core::{
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
+use object_store::ObjectStoreExt;
 use rstest::rstest;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
@@ -270,9 +272,15 @@ async fn managed_part_checks_real_file_before_creating_output(
         .await
         .unwrap_err();
     if field == "file_name" {
-        assert!(matches!(error, Error::NotFound { .. }), "{error}");
+        assert!(
+            matches!(error.find_root(), Error::NotFound { .. }),
+            "{error}"
+        );
     } else {
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            matches!(error.find_root(), Error::InvalidInput { .. }),
+            "{error}"
+        );
     }
     assert!(error.to_string().contains(message), "{error}");
     assert!(
@@ -783,10 +791,13 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
 
 #[tokio::test]
 async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        blob_field("blob", true),
-    ]));
+    let schema = Arc::new(ArrowSchema::new_with_metadata(
+        vec![
+            Field::new("id", DataType::Int32, false),
+            blob_field("blob", true),
+        ],
+        HashMap::from([(MANAGED_BLOBS_META_KEY.to_string(), "true".to_string())]),
+    ));
     let make_batch = |ids: Vec<i32>, values: Vec<&'static [u8]>| {
         let mut blobs = BlobArrayBuilder::new(values.len());
         for value in values {
@@ -885,4 +896,59 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
     let values = batch["blob"].as_binary::<i64>();
     assert_eq!(values.value(0), b"replacement-0");
     assert_eq!(values.value(1), b"replacement-1");
+}
+
+#[rstest]
+#[case::truncate(false)]
+#[case::grow(true)]
+#[tokio::test]
+async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: bool) {
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2])).unwrap();
+    let dataset = dataset_of(batch.clone(), LanceFileVersion::V2_2).await;
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        ConcreteFileVersion::V2_2,
+    )
+    .unwrap();
+    let part = write_part(&dataset, &target, None, batch).await;
+    let path = target
+        .parts_dir(&dataset.data_dir())
+        .join(part.file_name.as_str());
+    let store = dataset.object_store(None).await.unwrap();
+    let original = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+    let mut changed = original.to_vec();
+    if grow {
+        changed.push(0);
+    } else {
+        changed.pop();
+    }
+    store
+        .inner
+        .put(&path, Bytes::from(changed).into())
+        .await
+        .unwrap();
+    let error = dataset
+        .concat_data_file_parts(&target, std::slice::from_ref(&part))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.find_root(), Error::InvalidInput { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("expected complete file"),
+        "{error}"
+    );
+    assert!(
+        !store
+            .exists(&dataset.data_dir().join(target.file_name.as_str()))
+            .await
+            .unwrap()
+    );
+    store.inner.put(&path, original.into()).await.unwrap();
+    dataset
+        .concat_data_file_parts(&target, &[part])
+        .await
+        .unwrap();
 }

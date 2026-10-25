@@ -7,7 +7,12 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.sampler import ShardedBatchSampler, ShardedFixedBatchSampler, maybe_sample
+from lance.sampler import (
+    ShardedBatchSampler,
+    ShardedFixedBatchSampler,
+    ShardedFragmentSampler,
+    maybe_sample,
+)
 
 TEST_CONFIG = {
     "total_rows": 1000,
@@ -203,6 +208,25 @@ def test_randomization_effect():
     assert epoch1 != epoch2, "Different epochs should produce different orders"
 
 
+@pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
+def test_set_epoch_reshuffles(tmp_path: Path, sampler_cls):
+    ds = lance.write_dataset(
+        pa.table({"id": range(2000)}), tmp_path / "data.lance", max_rows_per_file=100
+    )
+    sampler = sampler_cls(rank=0, world_size=2, randomize=True, seed=42)
+
+    def first_ids():
+        batches = sampler(ds, columns=["id"], batch_size=100)
+        return [batch["id"][0].as_py() for batch in batches]
+
+    sampler.set_epoch(1)
+    epoch1 = first_ids()
+    sampler.set_epoch(2)
+    epoch2 = first_ids()
+
+    assert epoch1 != epoch2, "Different epochs should produce different orders"
+
+
 def test_edge_cases():
     """Validate handling of partial batches and data boundaries."""
 
@@ -289,19 +313,21 @@ def _assert_numpy_state(actual, expected):
     assert actual[2:] == expected[2:]
 
 
-def _legacy_stratified_batches(rows, n, batch_size, max_takes):
-    """Reference the old per-stratum offsets and output flush points."""
-    chunk_size, per_chunk = rows // max_takes, n // max_takes
-    sampled, pending, batches, states = 0, [], [], []
+def _current_stratified_batches(rows, n, batch_size, max_takes):
+    """Reference current main's ceil-sized strata and proportional row counts."""
+    chunk_size = (rows + max_takes - 1) // max_takes
+    pending, batches, states = [], [], []
     for start in range(0, rows, chunk_size):
-        if sampled >= n:
-            break
-        sampled += per_chunk
-        size = min(per_chunk, min(chunk_size, rows - start))
+        end = min(start + chunk_size, rows)
+        local_size = end - start
+        local_sample_size = n * end // rows - n * start // rows
+        if local_sample_size == 0:
+            continue
+
         offset = start
-        if size < min(chunk_size, rows - start):
-            offset += np.random.randint(0, min(chunk_size, rows - start) - size)
-        pending.extend(range(offset, offset + size))
+        if local_sample_size < local_size:
+            offset += int(np.random.randint(0, local_size - local_sample_size))
+        pending.extend(range(offset, offset + local_sample_size))
         if len(pending) >= batch_size:
             batches.append(pending)
             pending = []
@@ -344,14 +370,14 @@ def _patch_small_torch_sampler(monkeypatch, max_takes):
 
 @pytest.mark.parametrize("stop_early", [False, True], ids=["full", "early-stop"])
 @pytest.mark.parametrize(
-    "rows,n,expected_rows",
-    [(101, 17, 18), (97, 18, 17)],
-    ids=["overshoot", "undershoot"],
+    "rows,n,expected_batch_sizes",
+    [(101, 17, [6, 7, 4]), (97, 18, [7, 5, 6])],
+    ids=["uneven-tail-a", "uneven-tail-b"],
 )
 def test_maybe_sample_preserves_strata_and_rng(
     rows,
     n,
-    expected_rows,
+    expected_batch_sizes,
     stop_early,
     write_multifragment_dataset,
     preserve_numpy_state,
@@ -359,9 +385,9 @@ def test_maybe_sample_preserves_strata_and_rng(
     dataset = write_multifragment_dataset(
         pa.table({"id": np.arange(rows, dtype=np.int64)}), "sample.lance"
     )
-    batch_size, max_takes, seed = 1, 8, 2718
+    batch_size, max_takes, seed = 5, 8, 2718
     np.random.seed(seed)
-    expected, expected_states = _legacy_stratified_batches(
+    expected, expected_states = _current_stratified_batches(
         rows, n, batch_size, max_takes
     )
     np.random.seed(seed)
@@ -379,9 +405,12 @@ def test_maybe_sample_preserves_strata_and_rng(
     count = 1 if stop_early else len(expected)
     assert actual == expected[:count]
     assert list(map(len, actual)) == list(map(len, expected[:count]))
-    assert len(expected) == 9 and sum(map(len, expected)) == expected_rows
+    assert list(map(len, expected)) == expected_batch_sizes
+    assert sum(map(len, expected)) == n
+    assert len(set(row for batch in expected for row in batch)) == n
     for actual_state, expected_state in zip(states, expected_states[:count]):
         _assert_numpy_state(actual_state, expected_state)
+    _assert_numpy_state(np.random.get_state(), expected_states[count - 1])
 
 
 class _RecordingDataset:
@@ -406,7 +435,7 @@ def test_maybe_sample_coalesces_takes_at_8192_rows(
         )
     )
     np.random.seed(31415)
-    expected, states = _legacy_stratified_batches(rows, n, n, 1)
+    expected, states = _current_stratified_batches(rows, n, n, 1)
     np.random.seed(31415)
     actual = list(maybe_sample(dataset, n, {"row_id": "id"}, batch_size=n, max_takes=1))
     assert actual[0]["row_id"].to_pylist() == expected[0]
@@ -414,6 +443,30 @@ def test_maybe_sample_coalesces_takes_at_8192_rows(
     assert [batch.num_rows for batch in actual] == [n]
     assert dataset.take_sizes == [8192, 1]
     _assert_numpy_state(np.random.get_state(), states[-1])
+
+
+def test_maybe_sample_coalesces_multiple_strata_per_output_batch(
+    write_multifragment_dataset, preserve_numpy_state
+):
+    rows, n, batch_size, max_takes = 101, 17, 5, 8
+    dataset = _RecordingDataset(
+        write_multifragment_dataset(
+            pa.table({"id": np.arange(rows, dtype=np.int64)}),
+            "coalesced_strata.lance",
+        )
+    )
+    np.random.seed(2718)
+    expected, _ = _current_stratified_batches(rows, n, batch_size, max_takes)
+    np.random.seed(2718)
+
+    actual = list(
+        maybe_sample(dataset, n, ["id"], batch_size=batch_size, max_takes=max_takes)
+    )
+
+    assert [batch["id"].to_pylist() for batch in actual] == expected
+    assert [batch.num_rows for batch in actual] == [6, 7, 4]
+    # Three output batches coalesce the eight selected strata into three takes.
+    assert dataset.take_sizes == [6, 7, 4]
 
 
 def test_torch_dataset_preserves_prefetch_rows_and_rng(
@@ -428,7 +481,9 @@ def test_torch_dataset_preserves_prefetch_rows_and_rng(
     )
     _patch_small_torch_sampler(monkeypatch, max_takes)
     np.random.seed(1618)
-    expected, source_states = _legacy_stratified_batches(rows, n, batch_size, max_takes)
+    expected, source_states = _current_stratified_batches(
+        rows, n, batch_size, max_takes
+    )
     np.random.seed(1618)
     batches, states = [], []
     for batch in TorchDataset(
@@ -440,7 +495,7 @@ def test_torch_dataset_preserves_prefetch_rows_and_rng(
     ):
         batches.append(batch.tolist())
         states.append(_copy_numpy_state())
-    assert batches == expected and list(map(len, batches)) == [6, 6, 6]
+    assert batches == expected and list(map(len, batches)) == [6, 7, 4]
     prefetched_states = [source_states[1], source_states[2], source_states[2]]
     for actual, reference in zip(states, prefetched_states):
         _assert_numpy_state(actual, reference)
@@ -463,7 +518,7 @@ def test_sample_init_skips_nonfinite_rows_without_draining_prefetch(
     )
     _patch_small_torch_sampler(monkeypatch, max_takes)
     np.random.seed(5772)
-    expected, states = _legacy_stratified_batches(rows, n, batch_size, max_takes)
+    expected, states = _current_stratified_batches(rows, n, batch_size, max_takes)
     valid_ids = [row for batch in expected[:2] for row in batch if row >= 30][:k]
     np.random.seed(5772)
     torch_dataset = TorchDataset(
@@ -477,3 +532,85 @@ def test_sample_init_skips_nonfinite_rows_without_draining_prefetch(
     np.testing.assert_allclose(centroids.numpy(), vectors[valid_ids])
     assert np.isfinite(centroids.numpy()).all()
     _assert_numpy_state(np.random.get_state(), states[2])
+
+
+def test_maybe_sample_preserves_projection_nulls_and_deletions(
+    write_multifragment_dataset, preserve_numpy_state
+):
+    rows, n, batch_size, max_takes = 101, 13, 5, 4
+    nullable = pa.array([None] * rows, type=pa.int64())
+    dataset = write_multifragment_dataset(
+        pa.table({"id": np.arange(rows, dtype=np.int64), "nullable": nullable}),
+        "deleted_nulls.lance",
+        max_rows_per_file=17,
+    )
+    dataset.delete("id % 7 = 0")
+    visible = dataset.to_table(columns=["id", "nullable"])
+    visible_ids = visible["id"].to_pylist()
+    visible_nullable = visible["nullable"].to_pylist()
+    rows = len(dataset)
+
+    np.random.seed(5772)
+    expected, states = _current_stratified_batches(rows, n, batch_size, max_takes)
+    expected_ids = [[visible_ids[index] for index in batch] for batch in expected]
+    expected_nullable = [
+        [visible_nullable[index] for index in batch] for batch in expected
+    ]
+
+    recorded_dataset = _RecordingDataset(dataset)
+    np.random.seed(5772)
+    actual = list(
+        maybe_sample(
+            recorded_dataset,
+            n,
+            {"sampled_id": "id", "nullable_alias": "nullable"},
+            batch_size=batch_size,
+            max_takes=max_takes,
+        )
+    )
+
+    assert [batch["sampled_id"].to_pylist() for batch in actual] == expected_ids
+    assert [
+        batch["nullable_alias"].to_pylist() for batch in actual
+    ] == expected_nullable
+    assert [batch.num_rows for batch in actual] == list(map(len, expected))
+    assert sum(batch.num_rows for batch in actual) == n
+    assert all(value is None for batch in expected_nullable for value in batch)
+    assert all(size <= 8192 for size in recorded_dataset.take_sizes)
+    _assert_numpy_state(np.random.get_state(), states[-1])
+
+
+def test_maybe_sample_keeps_small_sample_path_when_max_takes_exceeds_rows(
+    write_multifragment_dataset, preserve_numpy_state
+):
+    rows, n, max_takes, seed = 23, 5, 32, 1618
+    dataset = _RecordingDataset(
+        write_multifragment_dataset(
+            pa.table({"id": np.arange(rows, dtype=np.int64)}),
+            "small_sample.lance",
+            max_rows_per_file=7,
+        )
+    )
+    np.random.seed(seed)
+    expected = np.random.choice(rows, n, replace=False).tolist()
+    expected_state = _copy_numpy_state()
+    np.random.seed(seed)
+
+    actual = list(maybe_sample(dataset, n, ["id"], batch_size=n, max_takes=max_takes))
+
+    assert [batch["id"].to_pylist() for batch in actual] == [expected]
+    assert dataset.take_sizes == [n]
+    _assert_numpy_state(np.random.get_state(), expected_state)
+
+
+@pytest.mark.parametrize("n", [100, 3000, 4095])
+def test_sample_dataset_returns_n_rows(tmp_path: Path, n: int):
+    ds = lance.write_dataset(pa.table({"id": range(10000)}), tmp_path / "data.lance")
+
+    batches = list(maybe_sample(ds, n, ["id"], max_takes=32))
+
+    ids = pa.concat_arrays([batch["id"] for batch in batches]).to_pylist()
+    assert len(ids) == n
+    assert len(set(ids)) == n
+    # Samples are spread over the whole dataset, not just its head.
+    assert max(ids) >= 10000 - 10000 // 32
